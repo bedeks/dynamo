@@ -259,6 +259,15 @@ class BaseConfigModifier:
         setattr(service, "volumeMounts", volume_mounts)
 
     @classmethod
+    def _attach_pvc_mounts(
+        cls, cfg: Config, pvc_name: str, pvc_mount_path: str
+    ) -> None:
+        """Attach a model-cache PVC without changing worker/frontend model args."""
+        cls._ensure_spec_pvc(cfg, pvc_name)
+        for svc in cfg.spec.services.values():
+            cls._ensure_service_volume_mount(svc, pvc_name, pvc_mount_path)
+
+    @classmethod
     def _update_container_args_preserving_shell_form(
         cls, container: Container, update_fn
     ) -> None:
@@ -543,17 +552,27 @@ class BaseConfigModifier:
         # Update model (handles worker args + frontend patching)
         effective_model_path = model_path or model_name
         if pvc_name and pvc_mount_path:
-            # Derive pvc_path from effective_model_path by stripping the mount prefix
-            pvc_path = ""
-            if effective_model_path and effective_model_path.startswith(pvc_mount_path):
+            if model_path and effective_model_path.startswith(pvc_mount_path):
+                # `model_path` points at a concrete location inside the PVC, so
+                # workers and frontend should use the mounted on-disk path.
                 pvc_path = effective_model_path[len(pvc_mount_path) :].strip("/")
-            result = cls.update_model_from_pvc(
-                cfg.model_dump(),
-                model_name=model_name,
-                pvc_name=pvc_name,
-                pvc_mount_path=pvc_mount_path,
-                pvc_path=pvc_path,
-            )
+                result = cls.update_model_from_pvc(
+                    cfg.model_dump(),
+                    model_name=model_name,
+                    pvc_name=pvc_name,
+                    pvc_mount_path=pvc_mount_path,
+                    pvc_path=pvc_path,
+                )
+            else:
+                # With only a PVC mount and no concrete path inside it, the PVC
+                # acts as the HuggingFace cache. Keep model args pointed at the
+                # HF model ID and only attach the volume mounts.
+                cls._attach_pvc_mounts(cfg, pvc_name, pvc_mount_path)
+                result = cls.update_model(
+                    cfg.model_dump(),
+                    model_name=model_name,
+                    model_path=effective_model_path,
+                )
         else:
             result = cls.update_model(
                 cfg.model_dump(),

@@ -33,6 +33,17 @@ pytestmark = [
 ]
 
 
+def _arg_value(args: list[str], flag: str) -> str | None:
+    """Return the value following ``flag`` from a flat CLI arg list."""
+    try:
+        idx = args.index(flag)
+    except ValueError:
+        return None
+    if idx + 1 >= len(args):
+        return None
+    return args[idx + 1]
+
+
 def test_build_dgd_config_shapes_multinode_worker_resources() -> None:
     """build_dgd_config applies per-node GPU shaping when topology is provided."""
     modifier = CONFIG_MODIFIERS["sglang"]
@@ -56,6 +67,65 @@ def test_build_dgd_config_shapes_multinode_worker_resources() -> None:
     )
     assert decode_service["resources"]["limits"]["gpu"] == "8"
     assert decode_service["multinode"] == {"nodeCount": 2}
+
+
+def test_build_dgd_config_with_pvc_mount_only_keeps_hf_model_id() -> None:
+    """PVC cache mounts should not rewrite model args without pvcModelPath."""
+    modifier = CONFIG_MODIFIERS["vllm"]
+    dgd_config = modifier.build_dgd_config(
+        mode="disagg",
+        model_name="Qwen/Qwen3-32B",
+        image="nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1",
+        prefill_cli_args=["--max-num-batched-tokens", "1024"],
+        decode_cli_args=["--max-num-batched-tokens", "1024"],
+        pvc_name="model-cache",
+        pvc_mount_path="/opt/model-cache",
+    )
+
+    services = dgd_config["spec"]["services"]
+    assert dgd_config["spec"]["pvcs"] == [{"name": "model-cache", "create": False}]
+
+    for name in ("VllmPrefillWorker", "VllmDecodeWorker"):
+        service = services[name]
+        assert service["volumeMounts"] == [
+            {"name": "model-cache", "mountPoint": "/opt/model-cache"}
+        ]
+        args = service["extraPodSpec"]["mainContainer"]["args"]
+        assert _arg_value(args, "--model") == "Qwen/Qwen3-32B"
+
+    frontend = services["Frontend"]
+    assert frontend["volumeMounts"] == [
+        {"name": "model-cache", "mountPoint": "/opt/model-cache"}
+    ]
+    main_container = frontend["extraPodSpec"]["mainContainer"]
+    assert main_container.get("command") is None
+    assert main_container.get("args") is None
+
+
+def test_build_dgd_config_with_pvc_model_path_uses_mounted_path() -> None:
+    """Explicit pvcModelPath should still patch workers and frontend to disk."""
+    modifier = CONFIG_MODIFIERS["vllm"]
+    dgd_config = modifier.build_dgd_config(
+        mode="disagg",
+        model_name="Qwen/Qwen3-32B",
+        model_path="/opt/model-cache/hub/models--Qwen--Qwen3-32B/snapshots/abc123",
+        image="nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.0.1",
+        prefill_cli_args=["--max-num-batched-tokens", "1024"],
+        decode_cli_args=["--max-num-batched-tokens", "1024"],
+        pvc_name="model-cache",
+        pvc_mount_path="/opt/model-cache",
+    )
+
+    expected_model_path = "/opt/model-cache/hub/models--Qwen--Qwen3-32B/snapshots/abc123"
+    services = dgd_config["spec"]["services"]
+
+    for name in ("VllmPrefillWorker", "VllmDecodeWorker"):
+        args = services[name]["extraPodSpec"]["mainContainer"]["args"]
+        assert _arg_value(args, "--model") == expected_model_path
+
+    frontend_args = services["Frontend"]["extraPodSpec"]["mainContainer"]["args"]
+    assert _arg_value(frontend_args, "--model-name") == "Qwen/Qwen3-32B"
+    assert _arg_value(frontend_args, "--model-path") == expected_model_path
 
 
 def test_apply_dgd_overrides_strips_envelope() -> None:
