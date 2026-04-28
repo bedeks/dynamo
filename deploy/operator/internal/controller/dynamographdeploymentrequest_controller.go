@@ -227,6 +227,7 @@ done
 
 # Read and parse status from YAML file
 STATUS=$(grep "^status:" "$STATUS_FILE" | awk '{print $2}' | tr -d '"' | tr -d "'")
+ERROR=""
 
 if [ -z "$STATUS" ]; then
   echo "ERROR: Invalid status file format"
@@ -243,7 +244,6 @@ case "$STATUS" in
     ERROR=$(grep "^error:" "$STATUS_FILE" | sed 's/^error: *//' | tr -d '"' | tr -d "'")
     MESSAGE=$(grep "^message:" "$STATUS_FILE" | sed 's/^message: *//' | tr -d '"' | tr -d "'")
     echo "ERROR: Profiler failed: ${ERROR:-$MESSAGE}"
-    exit 1
     ;;
   running)
     echo "ERROR: Profiler still running (unexpected)"
@@ -282,9 +282,14 @@ metadata:
 data:
   phase: "$FINAL_PHASE"
   message: "$FINAL_MESSAGE"
-  {{.OutputFile}}: |
 EOF
-sed 's/^/    /' {{.OutputPath}}/{{.OutputFile}} >> /tmp/cm.yaml
+echo "  status: \"$STATUS\"" >> /tmp/cm.yaml
+echo "  error: \"$ERROR\"" >> /tmp/cm.yaml
+
+if [ "$STATUS" = "success" ]; then
+  echo "  {{.OutputFile}}: |" >> /tmp/cm.yaml
+  sed 's/^/    /' {{.OutputPath}}/{{.OutputFile}} >> /tmp/cm.yaml
+fi
 
 # Add profiler status file for debugging
 if [ -f {{.OutputPath}}/profiler_status.yaml ]; then
@@ -609,6 +614,45 @@ func (r *DynamoGraphDeploymentRequestReconciler) handleProfilingPhase(ctx contex
 		}
 		// Don't requeue - we'll be triggered when the Job completes/fails
 		return ctrl.Result{}, nil
+	}
+
+	profilerStatus, profilerError, profilerMessage, err := r.getProfilingOutputStatus(ctx, dgdr)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if profilerStatus == "failed" {
+		failureReason := "ProfilingFailed"
+		if dgdr.Status.ProfilingPhase != "" {
+			failureReason = profilingPhaseFailureReason(dgdr.Status.ProfilingPhase)
+		}
+		failureMessage := profilerError
+		if failureMessage == "" {
+			failureMessage = profilerMessage
+		}
+		if failureMessage == "" {
+			failureMessage = "profiling failed"
+		}
+
+		dgdr.Status.Phase = nvidiacomv1beta1.DGDRPhaseFailed
+		meta.SetStatusCondition(&dgdr.Status.Conditions, metav1.Condition{
+			Type:               nvidiacomv1beta1.ConditionTypeSucceeded,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: dgdr.Generation,
+			Reason:             failureReason,
+			Message:            failureMessage,
+		})
+		dgdr.AddStatusCondition(metav1.Condition{
+			Type:               nvidiacomv1beta1.ConditionTypeProfiling,
+			Status:             metav1.ConditionFalse,
+			ObservedGeneration: dgdr.Generation,
+			Reason:             failureReason,
+			Message:            failureMessage,
+		})
+		if err := r.Status().Update(ctx, dgdr); err != nil {
+			return ctrl.Result{}, err
+		}
+		r.Recorder.Event(dgdr, corev1.EventTypeWarning, MessageProfilingCheckFailed, failureMessage)
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	profilingResults, dgdName, err := r.generateDGDSpec(ctx, dgdr)
@@ -997,6 +1041,24 @@ func getOutputConfigMapName(dgdr *nvidiacomv1beta1.DynamoGraphDeploymentRequest)
 	return fmt.Sprintf("%s%s", ConfigMapOutputPrefix, dgdr.Name)
 }
 
+func (r *DynamoGraphDeploymentRequestReconciler) getProfilingOutputStatus(
+	ctx context.Context,
+	dgdr *nvidiacomv1beta1.DynamoGraphDeploymentRequest,
+) (status, profilerError, message string, err error) {
+	cm := &corev1.ConfigMap{}
+	if err := r.Get(ctx, types.NamespacedName{
+		Name:      getOutputConfigMapName(dgdr),
+		Namespace: dgdr.Namespace,
+	}, cm); err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", "", "", nil
+		}
+		return "", "", "", fmt.Errorf("failed to get profiling output ConfigMap: %w", err)
+	}
+
+	return cm.Data["status"], cm.Data["error"], cm.Data["message"], nil
+}
+
 // isOnlineProfiling returns true. In v1beta1, the profiler decides online vs AIC
 // mode internally based on its config. The controller always uses the same label.
 func isOnlineProfiling(_ *nvidiacomv1beta1.DynamoGraphDeploymentRequest) bool {
@@ -1362,8 +1424,9 @@ func (r *DynamoGraphDeploymentRequestReconciler) createProfilingJob(ctx context.
 			})
 		}
 
-		// Limit retries to prevent infinite loop
-		backoffLimit := int32(3)
+		// Profiler-reported failures are terminal; avoid rerunning expensive profiling jobs
+		// unless the user explicitly overrides the Job spec.
+		backoffLimit := int32(0)
 
 		podSpec := corev1.PodSpec{
 			ServiceAccountName: ServiceAccountProfilingJob,

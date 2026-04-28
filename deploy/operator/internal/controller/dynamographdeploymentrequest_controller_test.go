@@ -19,6 +19,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	configv1alpha1 "github.com/ai-dynamo/dynamo/deploy/operator/api/config/v1alpha1"
@@ -1070,6 +1071,81 @@ var _ = Describe("DGDR Profiler Arguments", func() {
 
 			// Clean up
 			_ = k8sClient.Delete(ctx, job)
+		})
+
+		It("Should disable retries and persist profiler failure metadata in the sidecar script", func() {
+			ctx := context.Background()
+			namespace := defaultNamespace
+			dgdrName := "test-no-retries"
+
+			sa := &corev1.ServiceAccount{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      ServiceAccountProfilingJob,
+					Namespace: namespace,
+				},
+			}
+			Expect(k8sClient.Create(ctx, sa)).Should(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, sa) }()
+
+			dgdr := &nvidiacomv1beta1.DynamoGraphDeploymentRequest{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      dgdrName,
+					Namespace: namespace,
+				},
+				Spec: nvidiacomv1beta1.DynamoGraphDeploymentRequestSpec{
+					Model:   "test-model",
+					Backend: "trtllm",
+					Image:   "test-profiler:latest",
+					Hardware: &nvidiacomv1beta1.HardwareSpec{
+						NumGPUsPerNode: ptr.To[int32](8),
+						GPUSKU:         nvidiacomv1beta1.GPUSKUTypeH100SXM,
+						VRAMMB:         ptr.To(81920.0),
+						TotalGPUs:      ptr.To[int32](128),
+					},
+					SLA: &nvidiacomv1beta1.SLASpec{
+						TTFT: ptr.To(50.0),
+						ITL:  ptr.To(10.0),
+					},
+				},
+			}
+
+			Expect(k8sClient.Create(ctx, dgdr)).Should(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, dgdr) }()
+
+			var fetchedDGDR nvidiacomv1beta1.DynamoGraphDeploymentRequest
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: dgdrName, Namespace: namespace}, &fetchedDGDR)).Should(Succeed())
+
+			err := reconciler.createProfilingJob(ctx, &fetchedDGDR)
+			Expect(err).NotTo(HaveOccurred())
+
+			jobName := getProfilingJobName(&fetchedDGDR)
+			job := &batchv1.Job{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: jobName, Namespace: namespace}, job)).Should(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, job) }()
+
+			Expect(job.Spec.BackoffLimit).NotTo(BeNil())
+			Expect(*job.Spec.BackoffLimit).To(Equal(int32(0)))
+
+			var sidecar *corev1.Container
+			for i := range job.Spec.Template.Spec.Containers {
+				if job.Spec.Template.Spec.Containers[i].Name == ContainerNameOutputCopier {
+					sidecar = &job.Spec.Template.Spec.Containers[i]
+					break
+				}
+			}
+			Expect(sidecar).NotTo(BeNil())
+			Expect(sidecar.Args).To(HaveLen(1))
+
+			script := sidecar.Args[0]
+			Expect(script).To(ContainSubstring("echo \"  status: \\\"$STATUS\\\"\" >> /tmp/cm.yaml"))
+			Expect(script).To(ContainSubstring("echo \"  error: \\\"$ERROR\\\"\" >> /tmp/cm.yaml"))
+			Expect(script).To(ContainSubstring("if [ \"$STATUS\" = \"success\" ]; then"))
+
+			failedStart := strings.Index(script, "  failed)")
+			runningStart := strings.Index(script, "  running)")
+			Expect(failedStart).To(BeNumerically(">=", 0))
+			Expect(runningStart).To(BeNumerically(">", failedStart))
+			Expect(script[failedStart:runningStart]).NotTo(ContainSubstring("exit 1"))
 		})
 	})
 })
@@ -2579,6 +2655,103 @@ var _ = Describe("DGDR Profiling Failure Attribution", func() {
 			succeededCond := meta.FindStatusCondition(updated.Status.Conditions, nvidiacomv1beta1.ConditionTypeSucceeded)
 			Expect(succeededCond).NotTo(BeNil())
 			Expect(succeededCond.Reason).Should(Equal(nvidiacomv1beta1.ProfilingReasonSweepingDecodeFailed))
+		})
+
+		It("Should fail from output ConfigMap status without retrying the job", func() {
+			ctx := context.Background()
+			dgdrName := "test-dgdr-output-status-fail"
+			namespace := defaultNamespace
+
+			dgdr := &nvidiacomv1beta1.DynamoGraphDeploymentRequest{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      dgdrName,
+					Namespace: namespace,
+				},
+				Spec: nvidiacomv1beta1.DynamoGraphDeploymentRequestSpec{
+					Model:   "test-model",
+					Backend: "vllm",
+					Image:   "test-profiler:latest",
+					Hardware: &nvidiacomv1beta1.HardwareSpec{
+						NumGPUsPerNode: ptr.To[int32](8),
+						GPUSKU:         "h100_sxm",
+						VRAMMB:         ptr.To(81920.0),
+						TotalGPUs:      ptr.To[int32](128),
+					},
+					SLA: &nvidiacomv1beta1.SLASpec{
+						TTFT: ptr.To(100.0),
+						ITL:  ptr.To(1500.0),
+					},
+				},
+			}
+
+			Expect(k8sClient.Create(ctx, dgdr)).Should(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, dgdr) }()
+
+			dgdr.Status.Phase = nvidiacomv1beta1.DGDRPhaseProfiling
+			dgdr.Status.ProfilingPhase = nvidiacomv1beta1.ProfilingPhaseInitializing
+			Expect(k8sClient.Status().Update(ctx, dgdr)).Should(Succeed())
+
+			jobName := getProfilingJobName(dgdr)
+			job := &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      jobName,
+					Namespace: namespace,
+				},
+				Spec: batchv1.JobSpec{
+					Template: corev1.PodTemplateSpec{
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{
+								Name:  ContainerNameProfiler,
+								Image: "test",
+							}},
+							RestartPolicy: corev1.RestartPolicyNever,
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, job)).Should(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, job) }()
+
+			job.Status.Conditions = []batchv1.JobCondition{{
+				Type:   batchv1.JobComplete,
+				Status: corev1.ConditionTrue,
+			}}
+			Expect(k8sClient.Status().Update(ctx, job)).Should(Succeed())
+
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      getOutputConfigMapName(dgdr),
+					Namespace: namespace,
+				},
+				Data: map[string]string{
+					"phase":   string(nvidiacomv1beta1.ProfilingPhaseSweepingDecode),
+					"message": "Profiler stopped during decode sweep",
+					"status":  "failed",
+					"error":   "OOM while sweeping decode configs",
+				},
+			}
+			Expect(k8sClient.Create(ctx, cm)).Should(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, cm) }()
+
+			_, err := reconciler.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: dgdrName, Namespace: namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+
+			var updated nvidiacomv1beta1.DynamoGraphDeploymentRequest
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: dgdrName, Namespace: namespace}, &updated)).Should(Succeed())
+			Expect(updated.Status.Phase).Should(Equal(nvidiacomv1beta1.DGDRPhaseFailed))
+			Expect(updated.Status.ProfilingPhase).Should(Equal(nvidiacomv1beta1.ProfilingPhaseSweepingDecode))
+
+			profilingCond := meta.FindStatusCondition(updated.Status.Conditions, nvidiacomv1beta1.ConditionTypeProfiling)
+			Expect(profilingCond).NotTo(BeNil())
+			Expect(profilingCond.Reason).Should(Equal(nvidiacomv1beta1.ProfilingReasonSweepingDecodeFailed))
+			Expect(profilingCond.Message).Should(Equal("OOM while sweeping decode configs"))
+
+			succeededCond := meta.FindStatusCondition(updated.Status.Conditions, nvidiacomv1beta1.ConditionTypeSucceeded)
+			Expect(succeededCond).NotTo(BeNil())
+			Expect(succeededCond.Reason).Should(Equal(nvidiacomv1beta1.ProfilingReasonSweepingDecodeFailed))
+			Expect(succeededCond.Message).Should(Equal("OOM while sweeping decode configs"))
 		})
 
 		It("Should use generic ProfilingFailed when no sub-phase info available", func() {
